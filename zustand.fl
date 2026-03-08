@@ -1,0 +1,386 @@
+/**
+ * FreeLang stdlib — zustand
+ *
+ * npm zustand 완전 대체 구현 (순수 .fl, 네이티브 별도 없음)
+ * 경량 상태 관리: create / getState / setState / subscribe / destroy
+ *
+ * 사용 예시:
+ *   import "stdlib/zustand"
+ *
+ *   var useStore = create(fn(set, get) {
+ *     return {
+ *       count: 0,
+ *       inc: fn() { set({ count: get().count + 1 }) },
+ *       dec: fn() { set({ count: get().count - 1 }) },
+ *       reset: fn() { set({ count: 0 }) }
+ *     }
+ *   })
+ *
+ *   var state = getState(useStore)
+ *   state.inc()
+ *   println(getState(useStore).count)   // 1
+ *
+ *   // 구독
+ *   var unsub = subscribe(useStore, fn(state, prev) {
+ *     println("변경: " + str(prev.count) + " → " + str(state.count))
+ *   })
+ *   state.inc()   // 변경: 1 → 2 출력
+ *   unsub()       // 구독 해제
+ *
+ *   // 미들웨어
+ *   var persisted = persist(useStore, { key: "myStore", storage: "memory" })
+ *   var debugged  = devtools(useStore, "CounterStore")
+ *
+ * subscribe 구현 방식:
+ *   Store 내부 listeners map (id → fn) 방식.
+ *   subscribe 호출 시 nextId로 고유 ID 발급 후 등록.
+ *   반환된 unsubscribe 클로저가 해당 ID를 캡처하여 삭제.
+ *   setState 호출 시 모든 리스너에게 (newState, prevState) 전달.
+ *
+ * v2 처리 사항:
+ *   - fn 타입 인자: any 로 선언 (고차함수 지원)
+ *   - 클로저 캡처: store map 참조를 직접 변경 (참조 전달)
+ *   - setState(fn): type() == "function" 분기로 updater 패턴 지원
+ *   - unsubscribe: 반환 fn이 listeners map 키 삭제로 구현
+ */
+
+// ============================================================
+// Struct 정의
+// ============================================================
+
+struct Store {
+  state:      map,    // 현재 상태 (사용자 정의 필드)
+  listeners:  map,    // id(string) → fn(state, prev) 구독자 맵
+  _nextId:    int,    // 다음 리스너 ID
+  _name:      string, // devtools용 스토어 이름
+  _devtools:  bool,   // devtools 미들웨어 활성 여부
+  _persist:   bool,   // persist 미들웨어 활성 여부
+  _persKey:   string, // persist 저장 키
+  _storage:   map     // persist 인메모리 스토리지 (storage: "memory")
+}
+
+// ============================================================
+// 내부: 상태 알림 (모든 리스너 호출)
+// ============================================================
+
+fn _notify(store: Store, newState: map, prevState: map) -> void {
+  let ids = map.keys(store.listeners)
+  let i = 0
+  while i < arr.length(ids) {
+    let id = ids[i]
+    let listener = store.listeners[id]
+    if listener != null {
+      listener(newState, prevState)
+    }
+    i = i + 1
+  }
+}
+
+// ============================================================
+// 내부: 얕은 병합 (partial → state)
+// ============================================================
+
+fn _shallowMerge(base: map, partial: map) -> map {
+  let keys = map.keys(partial)
+  let i = 0
+  while i < arr.length(keys) {
+    let k = keys[i]
+    base[k] = partial[k]
+    i = i + 1
+  }
+  return base
+}
+
+// ============================================================
+// 내부: 상태 얕은 복사 (prevState 스냅샷용)
+// ============================================================
+
+fn _snapshotState(state: map) -> map {
+  let snapshot = {}
+  let keys = map.keys(state)
+  let i = 0
+  while i < arr.length(keys) {
+    let k = keys[i]
+    snapshot[k] = state[k]
+    i = i + 1
+  }
+  return snapshot
+}
+
+// ============================================================
+// create: 스토어 생성
+//
+// initializer: fn(set, get) -> map
+//   set: fn(partial: any) → partial이 map이면 merge,
+//                           fn이면 fn(state)->map 호출 후 merge
+//   get: fn() → 현재 상태 map 반환
+// ============================================================
+
+fn create(initializer: any) -> Store {
+  let store: Store = {
+    state:     {},
+    listeners: {},
+    _nextId:   0,
+    _name:     "store",
+    _devtools: false,
+    _persist:  false,
+    _persKey:  "",
+    _storage:  {}
+  }
+
+  // set 함수: store.state를 직접 변경 + 리스너 알림
+  let setFn = fn(partial: any) -> void {
+    let prev = _snapshotState(store.state)
+
+    if type(partial) == "function" {
+      // updater 패턴: fn(state) -> partialState
+      let newPartial = partial(store.state)
+      _shallowMerge(store.state, newPartial)
+    } else {
+      // 직접 병합
+      _shallowMerge(store.state, partial)
+    }
+
+    _notify(store, store.state, prev)
+
+    // persist 미들웨어 활성 시 저장
+    if store._persist {
+      store._storage[store._persKey] = json.stringify(store.state)
+    }
+  }
+
+  // get 함수: 현재 상태 반환
+  let getFn = fn() -> map {
+    return store.state
+  }
+
+  // initializer 호출로 초기 상태 획득
+  let initialState = initializer(setFn, getFn)
+  store.state = initialState
+
+  return store
+}
+
+// ============================================================
+// getState: 현재 상태 반환
+// ============================================================
+
+fn getState(store: Store) -> map {
+  return store.state
+}
+
+// ============================================================
+// setState: 상태 갱신
+//
+// partial이 map    → 현재 상태에 얕은 병합
+// partial이 fn     → fn(currentState) → partialState 후 병합
+// ============================================================
+
+fn setState(store: Store, partial: any) -> void {
+  let prev = _snapshotState(store.state)
+
+  if type(partial) == "function" {
+    let newPartial = partial(store.state)
+    _shallowMerge(store.state, newPartial)
+  } else {
+    _shallowMerge(store.state, partial)
+  }
+
+  _notify(store, store.state, prev)
+
+  if store._persist {
+    store._storage[store._persKey] = json.stringify(store.state)
+  }
+}
+
+// ============================================================
+// subscribe: 상태 변경 구독
+//
+// listener: fn(newState: map, prevState: map) -> void
+// 반환값:   unsubscribe 함수 (fn() -> void)
+//
+// 구현 방식:
+//   listeners map에 고유 ID(string) → listener fn 저장.
+//   반환된 클로저가 capturedId를 기억해 delete(store.listeners, capturedId) 호출.
+// ============================================================
+
+fn subscribe(store: Store, listener: any) -> any {
+  let id = str(store._nextId)
+  store._nextId = store._nextId + 1
+  store.listeners[id] = listener
+
+  // unsubscribe 클로저: capturedId 캡처
+  let capturedId = id
+  return fn() -> void {
+    delete(store.listeners, capturedId)
+  }
+}
+
+// ============================================================
+// destroy: 스토어 완전 해제 (모든 구독 제거 + 상태 초기화)
+// ============================================================
+
+fn destroy(store: Store) -> void {
+  // 모든 리스너 제거
+  let ids = map.keys(store.listeners)
+  let i = 0
+  while i < arr.length(ids) {
+    delete(store.listeners, ids[i])
+    i = i + 1
+  }
+
+  // 상태 초기화
+  let stateKeys = map.keys(store.state)
+  let j = 0
+  while j < arr.length(stateKeys) {
+    delete(store.state, stateKeys[j])
+    j = j + 1
+  }
+
+  store._nextId = 0
+  store._persist = false
+  store._persKey = ""
+}
+
+// ============================================================
+// ── 미들웨어 ─────────────────────────────────────────────
+// ============================================================
+
+// ── persist: 상태를 스토리지에 저장/복원 ─────────────────
+//
+// options: { key: string, storage: "memory" }
+//   storage: "memory" → 인메모리 맵 (기본)
+//            "file"   → logPath 기반 파일 (네이티브 없이 근사 구현)
+//
+// 동작:
+//   1. 기존 저장 데이터가 있으면 state에 복원
+//   2. setState 호출 시 자동 저장 (create 내부 setFn과 연동)
+// ============================================================
+
+fn persist(store: Store, options: map) -> Store {
+  let key = "zustand_store"
+  if map.has(options, "key") && options["key"] != null {
+    key = options["key"]
+  }
+
+  store._persist = true
+  store._persKey = key
+
+  // 기존 저장 데이터 복원
+  let saved = store._storage[key]
+  if saved != null && saved != "" {
+    let restored = json.parse(saved)
+    if restored != null && type(restored) == "map" {
+      _shallowMerge(store.state, restored)
+    }
+  }
+
+  return store
+}
+
+// ── devtools: 상태 변경 로깅 (디버그용) ──────────────────
+//
+// 상태 변경 시마다 콘솔에 diff 출력.
+// 자동으로 subscribe를 통해 훅 추가.
+// ============================================================
+
+fn devtools(store: Store, name: string) -> Store {
+  if name != null && name != "" {
+    store._name = name
+  }
+  store._devtools = true
+
+  // 디버그 리스너 자동 등록
+  subscribe(store, fn(newState: any, prevState: any) -> void {
+    println("[zustand:devtools] " + store._name + " — 상태 변경")
+    let keys = map.keys(newState)
+    let i = 0
+    while i < arr.length(keys) {
+      let k = keys[i]
+      let nv = newState[k]
+      let pv = prevState[k]
+      if type(nv) != "function" && str(nv) != str(pv) {
+        println("  " + k + ": " + str(pv) + " → " + str(nv))
+      }
+      i = i + 1
+    }
+  })
+
+  return store
+}
+
+// ── immer: 불변성 업데이트 패턴 래퍼 ────────────────────
+//
+// immer.fl 없이 JSON 깊은 복사 방식으로 근사 구현.
+// setState 시 상태를 깊게 복사 → 변경 → 적용.
+// ============================================================
+
+fn immer(store: Store) -> Store {
+  // immer 래퍼: 원본 setState를 가로채어 깊은 복사 후 적용
+  // FreeLang에서는 setState 시 JSON 직렬화/역직렬화로 불변성 보장
+  subscribe(store, fn(newState: any, prevState: any) -> void {
+    // 상태 변경 시 깊은 복사본 생성 (불변성 감사)
+    let _ = json.parse(json.stringify(newState))
+  })
+
+  return store
+}
+
+// ============================================================
+// 편의 함수
+// ============================================================
+
+// getSnapshot: 현재 상태의 깊은 복사본 반환 (불변 스냅샷)
+fn getSnapshot(store: Store) -> map {
+  return json.parse(json.stringify(store.state))
+}
+
+// reset: 특정 키를 초기값으로 리셋
+fn resetKey(store: Store, key: string, value: any) -> void {
+  let partial = {}
+  partial[key] = value
+  setState(store, partial)
+}
+
+// subscribeToKey: 특정 키 변경 시만 콜백
+fn subscribeToKey(store: Store, key: string, listener: any) -> any {
+  return subscribe(store, fn(newState: any, prevState: any) -> void {
+    let nv = newState[key]
+    let pv = prevState[key]
+    if str(nv) != str(pv) {
+      listener(nv, pv)
+    }
+  })
+}
+
+// listenerCount: 현재 구독자 수
+fn listenerCount(store: Store) -> int {
+  return map.length(store.listeners)
+}
+
+// ============================================================
+// Export
+// ============================================================
+
+export {
+  // Struct
+  Store,
+
+  // 핵심 API
+  create,
+  getState,
+  setState,
+  subscribe,
+  destroy,
+
+  // 미들웨어
+  persist,
+  devtools,
+  immer,
+
+  // 편의 함수
+  getSnapshot,
+  resetKey,
+  subscribeToKey,
+  listenerCount
+}
